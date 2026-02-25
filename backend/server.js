@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const Sentiment = require("sentiment");
+const axios = require("axios");
 const { mockMentions, responseTemplates } = require("./mockData");
 
 const app = express();
@@ -9,12 +10,11 @@ const sentimentAnalyzer = new Sentiment();
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// Inject brand name into text and analyze sentiment
-function processMention(mention, brand) {
-  const text = mention.text.replace(/\{\{BRAND\}\}/g, brand);
-  const analysis = sentimentAnalyzer.analyze(text);
+// ─── Sentiment Analysis ───────────────────────────────────────────────────────
 
-  let sentimentLabel, sentimentScore, context;
+function analyzeMention(raw) {
+  const analysis = sentimentAnalyzer.analyze(raw.text);
+  let sentimentLabel, sentimentScore;
 
   if (analysis.score > 2) {
     sentimentLabel = "positive";
@@ -27,54 +27,22 @@ function processMention(mention, brand) {
     sentimentScore = 50;
   }
 
-  // Determine context
-  const lowerText = text.toLowerCase();
-  if (
-    lowerText.includes("crash") ||
-    lowerText.includes("broken") ||
-    lowerText.includes("fix") ||
-    lowerText.includes("denied") ||
-    lowerText.includes("unacceptable") ||
-    lowerText.includes("lost") ||
-    lowerText.includes("refused")
-  ) {
+  const t = raw.text.toLowerCase();
+  let context;
+  if (t.includes("crash") || t.includes("broken") || t.includes("fix") || t.includes("denied") || t.includes("unacceptable") || t.includes("lost") || t.includes("refused")) {
     context = "complaint";
-  } else if (
-    lowerText.includes("?") ||
-    lowerText.includes("anyone") ||
-    lowerText.includes("thinking of") ||
-    lowerText.includes("question")
-  ) {
+  } else if (t.includes("?") || t.includes("anyone") || t.includes("thinking of") || t.includes("question")) {
     context = "question";
-  } else if (
-    lowerText.includes("incredible") ||
-    lowerText.includes("love") ||
-    lowerText.includes("amazing") ||
-    lowerText.includes("obsessed") ||
-    lowerText.includes("thrilled") ||
-    lowerText.includes("blown away") ||
-    lowerText.includes("chef's kiss")
-  ) {
+  } else if (t.includes("incredible") || t.includes("love") || t.includes("amazing") || t.includes("obsessed") || t.includes("thrilled") || t.includes("blown away")) {
     context = "praise";
-  } else if (
-    lowerText.includes("announce") ||
-    lowerText.includes("raises") ||
-    lowerText.includes("named") ||
-    lowerText.includes("partnership") ||
-    lowerText.includes("sale") ||
-    lowerText.includes("comparing") ||
-    lowerText.includes("analysis") ||
-    lowerText.includes("signals") ||
-    lowerText.includes("earnings")
-  ) {
+  } else if (t.includes("announce") || t.includes("raises") || t.includes("named") || t.includes("partnership") || t.includes("sale") || t.includes("analysis") || t.includes("earnings")) {
     context = "discussion";
   } else {
     context = sentimentLabel === "positive" ? "praise" : sentimentLabel === "negative" ? "complaint" : "discussion";
   }
 
   return {
-    ...mention,
-    text,
+    ...raw,
     sentiment: sentimentLabel,
     sentimentScore: Math.round(sentimentScore),
     context,
@@ -84,50 +52,186 @@ function processMention(mention, brand) {
   };
 }
 
-// GET /api/mentions?brand=BrandName
-app.get("/api/mentions", (req, res) => {
-  const brand = req.query.brand || "YourBrand";
-  const platform = req.query.platform;
-  const sentiment = req.query.sentiment;
-  const context = req.query.context;
+// ─── Data Sources ─────────────────────────────────────────────────────────────
 
-  let processed = mockMentions.map((m) => processMention(m, brand));
+let mentionIdCounter = 10000;
+function nextId() { return ++mentionIdCounter; }
+
+// Reddit (no API key needed)
+async function fetchReddit(brand) {
+  try {
+    const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(brand)}&sort=new&limit=25&t=week`;
+    const { data } = await axios.get(url, {
+      headers: { "User-Agent": "BrandMonitor/1.0" },
+      timeout: 8000,
+    });
+    return (data?.data?.children || []).map((child) => {
+      const post = child.data;
+      return {
+        id: nextId(),
+        platform: "Reddit",
+        author: `u/${post.author}`,
+        text: `${post.title}${post.selftext ? " — " + post.selftext.slice(0, 200) : ""}`,
+        timestamp: new Date(post.created_utc * 1000).toISOString(),
+        url: `https://reddit.com${post.permalink}`,
+        likes: post.ups || 0,
+        shares: 0,
+        source: "live",
+      };
+    });
+  } catch (err) {
+    console.error("Reddit fetch error:", err.message);
+    return [];
+  }
+}
+
+// News API
+async function fetchNews(brand) {
+  const key = process.env.NEWSAPI_KEY;
+  if (!key) return [];
+  try {
+    const url = `https://newsapi.org/v2/everything?q=${encodeURIComponent(brand)}&sortBy=publishedAt&pageSize=25&language=en&apiKey=${key}`;
+    const { data } = await axios.get(url, { timeout: 8000 });
+    return (data?.articles || []).map((article) => ({
+      id: nextId(),
+      platform: "News",
+      author: article.author || article.source?.name || "Unknown",
+      text: `${article.title}${article.description ? " — " + article.description : ""}`,
+      timestamp: article.publishedAt || new Date().toISOString(),
+      url: article.url,
+      likes: 0,
+      shares: 0,
+      source: "live",
+    }));
+  } catch (err) {
+    console.error("News API fetch error:", err.message);
+    return [];
+  }
+}
+
+// YouTube API
+async function fetchYouTube(brand) {
+  const key = process.env.YOUTUBE_API_KEY;
+  if (!key) return [];
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(brand)}&type=video&maxResults=25&order=date&key=${key}`;
+    const { data } = await axios.get(url, { timeout: 8000 });
+    return (data?.items || []).map((item) => ({
+      id: nextId(),
+      platform: "YouTube",
+      author: item.snippet.channelTitle,
+      text: `${item.snippet.title} — ${item.snippet.description?.slice(0, 200) || ""}`,
+      timestamp: item.snippet.publishedAt,
+      url: `https://www.youtube.com/watch?v=${item.id.videoId}`,
+      likes: 0,
+      shares: 0,
+      source: "live",
+    }));
+  } catch (err) {
+    console.error("YouTube fetch error:", err.message);
+    return [];
+  }
+}
+
+// Twitter / X API
+async function fetchTwitter(brand) {
+  const token = process.env.TWITTER_BEARER_TOKEN;
+  if (!token) return [];
+  try {
+    const query = encodeURIComponent(`${brand} -is:retweet lang:en`);
+    const url = `https://api.twitter.com/2/tweets/search/recent?query=${query}&max_results=25&tweet.fields=created_at,public_metrics,author_id&expansions=author_id&user.fields=username`;
+    const { data } = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 8000,
+    });
+    const users = {};
+    (data?.includes?.users || []).forEach((u) => { users[u.id] = u.username; });
+    return (data?.data || []).map((tweet) => ({
+      id: nextId(),
+      platform: "Twitter",
+      author: `@${users[tweet.author_id] || tweet.author_id}`,
+      text: tweet.text,
+      timestamp: tweet.created_at,
+      url: `https://twitter.com/i/web/status/${tweet.id}`,
+      likes: tweet.public_metrics?.like_count || 0,
+      shares: tweet.public_metrics?.retweet_count || 0,
+      source: "live",
+    }));
+  } catch (err) {
+    console.error("Twitter fetch error:", err.message);
+    return [];
+  }
+}
+
+// Mock data fallback
+function fetchMock(brand) {
+  return mockMentions.map((m) => ({
+    ...m,
+    text: m.text.replace(/\{\{BRAND\}\}/g, brand),
+    source: "mock",
+  }));
+}
+
+// Fetch all sources in parallel
+async function fetchAllMentions(brand) {
+  const [reddit, news, youtube, twitter] = await Promise.all([
+    fetchReddit(brand),
+    fetchNews(brand),
+    fetchYouTube(brand),
+    fetchTwitter(brand),
+  ]);
+
+  const live = [...reddit, ...news, ...youtube, ...twitter];
+  const base = live.length > 0 ? live : fetchMock(brand);
+  return base.map(analyzeMention).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
+
+app.get("/api/mentions", async (req, res) => {
+  const brand = req.query.brand || "YourBrand";
+  const { platform, sentiment, context } = req.query;
+
+  let mentions = await fetchAllMentions(brand);
 
   if (platform && platform !== "all") {
-    processed = processed.filter(
-      (m) => m.platform.toLowerCase() === platform.toLowerCase()
-    );
+    mentions = mentions.filter((m) => m.platform.toLowerCase() === platform.toLowerCase());
   }
   if (sentiment && sentiment !== "all") {
-    processed = processed.filter((m) => m.sentiment === sentiment);
+    mentions = mentions.filter((m) => m.sentiment === sentiment);
   }
   if (context && context !== "all") {
-    processed = processed.filter((m) => m.context === context);
+    mentions = mentions.filter((m) => m.context === context);
   }
 
-  res.json({ brand, mentions: processed, total: processed.length });
+  res.json({ brand, mentions, total: mentions.length });
 });
 
-// GET /api/summary?brand=BrandName
-app.get("/api/summary", (req, res) => {
+app.get("/api/summary", async (req, res) => {
   const brand = req.query.brand || "YourBrand";
-  const processed = mockMentions.map((m) => processMention(m, brand));
+  const mentions = await fetchAllMentions(brand);
 
   const summary = {
-    total: processed.length,
-    positive: processed.filter((m) => m.sentiment === "positive").length,
-    negative: processed.filter((m) => m.sentiment === "negative").length,
-    neutral: processed.filter((m) => m.sentiment === "neutral").length,
+    total: mentions.length,
+    positive: mentions.filter((m) => m.sentiment === "positive").length,
+    negative: mentions.filter((m) => m.sentiment === "negative").length,
+    neutral: mentions.filter((m) => m.sentiment === "neutral").length,
     byPlatform: {},
     bySentimentOverTime: [],
     avgSentimentScore: 0,
     topPositiveWords: [],
     topNegativeWords: [],
-    reachEstimate: processed.reduce((sum, m) => sum + (m.likes || 0) + (m.shares || 0) * 3, 0),
+    reachEstimate: mentions.reduce((sum, m) => sum + (m.likes || 0) + (m.shares || 0) * 3, 0),
+    sources: {
+      reddit: mentions.filter((m) => m.platform === "Reddit").length,
+      news: mentions.filter((m) => m.platform === "News").length,
+      youtube: mentions.filter((m) => m.platform === "YouTube").length,
+      twitter: mentions.filter((m) => m.platform === "Twitter").length,
+      mock: mentions.filter((m) => m.source === "mock").length,
+    },
   };
 
-  // Platform breakdown
-  processed.forEach((m) => {
+  mentions.forEach((m) => {
     if (!summary.byPlatform[m.platform]) {
       summary.byPlatform[m.platform] = { positive: 0, negative: 0, neutral: 0, total: 0 };
     }
@@ -135,49 +239,39 @@ app.get("/api/summary", (req, res) => {
     summary.byPlatform[m.platform].total++;
   });
 
-  // Sentiment over time (last 3 days bucketed by day)
   const days = {};
-  processed.forEach((m) => {
+  mentions.forEach((m) => {
     const day = m.timestamp.split("T")[0];
     if (!days[day]) days[day] = { positive: 0, negative: 0, neutral: 0, date: day };
     days[day][m.sentiment]++;
   });
   summary.bySentimentOverTime = Object.values(days).sort((a, b) => a.date.localeCompare(b.date));
 
-  // Average sentiment score
-  summary.avgSentimentScore = Math.round(
-    processed.reduce((sum, m) => sum + m.sentimentScore, 0) / processed.length
-  );
+  summary.avgSentimentScore = mentions.length
+    ? Math.round(mentions.reduce((sum, m) => sum + m.sentimentScore, 0) / mentions.length)
+    : 0;
 
-  // Word frequency
   const posWords = {}, negWords = {};
-  processed.forEach((m) => {
-    m.positiveWords.forEach((w) => { posWords[w] = (posWords[w] || 0) + 1; });
-    m.negativeWords.forEach((w) => { negWords[w] = (negWords[w] || 0) + 1; });
+  mentions.forEach((m) => {
+    (m.positiveWords || []).forEach((w) => { posWords[w] = (posWords[w] || 0) + 1; });
+    (m.negativeWords || []).forEach((w) => { negWords[w] = (negWords[w] || 0) + 1; });
   });
-  summary.topPositiveWords = Object.entries(posWords)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([word, count]) => ({ word, count }));
-  summary.topNegativeWords = Object.entries(negWords)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([word, count]) => ({ word, count }));
+  summary.topPositiveWords = Object.entries(posWords).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([word, count]) => ({ word, count }));
+  summary.topNegativeWords = Object.entries(negWords).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([word, count]) => ({ word, count }));
 
   res.json({ brand, summary });
 });
 
-// GET /api/recommendations?mentionId=1&brand=BrandName
-app.get("/api/recommendations", (req, res) => {
+app.get("/api/recommendations", async (req, res) => {
   const brand = req.query.brand || "YourBrand";
   const mentionId = parseInt(req.query.mentionId);
 
-  const rawMention = mockMentions.find((m) => m.id === mentionId);
-  if (!rawMention) {
+  const allMentions = await fetchAllMentions(brand);
+  const mention = allMentions.find((m) => m.id === mentionId);
+
+  if (!mention) {
     return res.status(404).json({ error: "Mention not found" });
   }
-
-  const mention = processMention(rawMention, brand);
 
   let templateKey;
   if (mention.sentiment === "negative" && mention.context === "complaint") {
@@ -191,7 +285,6 @@ app.get("/api/recommendations", (req, res) => {
   }
 
   const recommendation = responseTemplates[templateKey];
-
   res.json({
     mention,
     recommendation: {
@@ -203,13 +296,25 @@ app.get("/api/recommendations", (req, res) => {
   });
 });
 
-// GET /api/platforms
 app.get("/api/platforms", (req, res) => {
-  const platforms = [...new Set(mockMentions.map((m) => m.platform))];
+  const platforms = ["Reddit", "News", "YouTube", "Twitter"];
   res.json({ platforms });
+});
+
+// Health check — shows which keys are configured
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    keys: {
+      newsapi: !!process.env.NEWSAPI_KEY,
+      youtube: !!process.env.YOUTUBE_API_KEY,
+      twitter: !!process.env.TWITTER_BEARER_TOKEN,
+      reddit: true,
+    },
+  });
 });
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`Brand Monitor API running on http://localhost:${PORT}`);
+  console.log(`Brand Monitor API running on port ${PORT}`);
 });
