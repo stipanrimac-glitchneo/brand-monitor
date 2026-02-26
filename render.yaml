@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: brand-monitor
+    env: node
+    buildCommand: cd frontend && npm install && npm run build && cd ../backend && npm install
+    startCommand: node backend/server.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: TWITTER_BEARER_TOKEN
+        sync: false

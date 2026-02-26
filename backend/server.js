@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const Sentiment = require("sentiment");
 const axios = require("axios");
 const { mockMentions, responseTemplates } = require("./mockData");
@@ -9,6 +10,10 @@ const sentimentAnalyzer = new Sentiment();
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
+
+// Serve built frontend
+const distPath = path.join(__dirname, "../frontend/dist");
+app.use(express.static(distPath));
 
 // ─── Sentiment Analysis ───────────────────────────────────────────────────────
 
@@ -312,6 +317,11 @@ app.get("/api/health", (req, res) => {
       reddit: true,
     },
   });
+});
+
+// Catch-all: serve React app for any non-API route
+app.get("*", (req, res) => {
+  res.sendFile(path.join(distPath, "index.html"));
 });
 
 const PORT = process.env.PORT || 3001;
