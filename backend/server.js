@@ -62,6 +62,30 @@ function analyzeMention(raw) {
 let mentionIdCounter = 10000;
 function nextId() { return ++mentionIdCounter; }
 
+// ─── Mention Cache (5 min TTL) ────────────────────────────────────────────────
+const mentionCache = new Map(); // brand → { mentions, expiresAt }
+const CACHE_TTL = 5 * 60 * 1000;
+
+async function getCachedMentions(brand) {
+  const now = Date.now();
+  const cached = mentionCache.get(brand);
+  if (cached && cached.expiresAt > now) return cached.mentions;
+
+  const [reddit, news, youtube, twitter] = await Promise.all([
+    fetchReddit(brand),
+    fetchNews(brand),
+    fetchYouTube(brand),
+    fetchTwitter(brand),
+  ]);
+
+  const live = [...reddit, ...news, ...youtube, ...twitter];
+  const base = live.length > 0 ? live : fetchMock(brand);
+  const mentions = base.map(analyzeMention).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  mentionCache.set(brand, { mentions, expiresAt: now + CACHE_TTL });
+  return mentions;
+}
+
 // Reddit (no API key needed)
 async function fetchReddit(brand) {
   try {
@@ -177,18 +201,9 @@ function fetchMock(brand) {
   }));
 }
 
-// Fetch all sources in parallel
+// Fetch all sources in parallel (use cache to keep IDs stable)
 async function fetchAllMentions(brand) {
-  const [reddit, news, youtube, twitter] = await Promise.all([
-    fetchReddit(brand),
-    fetchNews(brand),
-    fetchYouTube(brand),
-    fetchTwitter(brand),
-  ]);
-
-  const live = [...reddit, ...news, ...youtube, ...twitter];
-  const base = live.length > 0 ? live : fetchMock(brand);
-  return base.map(analyzeMention).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  return getCachedMentions(brand);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
